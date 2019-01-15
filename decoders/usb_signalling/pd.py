@@ -19,6 +19,7 @@
 ##
 
 import sigrokdecode as srd
+import collections
 
 '''
 OUTPUT_PYTHON format:
@@ -191,19 +192,41 @@ class Decoder(srd.Decoder):
         self.put(s, e, self.out_ann, data)
 
     def set_new_target_samplenum(self):
-        self.samplepos += self.bitwidth;
+        self.samplepos += self.bitwidth
         self.samplenum_target = int(self.samplepos)
         self.samplenum_lastedge = self.samplenum_edge
         self.samplenum_edge = int(self.samplepos - (self.bitwidth / 2))
+
+    def samplepos_quality(self, samplepos):
+        # We use the lookahead buffer to see where it is furthest
+        # to getting an SE0 or SE1 state (indicating likley sampling on
+        # an edge).
+        samplepos += self.bitwidth * 2
+        for (samplenum, pins) in self.lookahead_buffer:
+          if (samplenum < int(samplepos)):
+            continue
+          if symbols[self.signalling][tuple(pins)] not in ['J', 'K']:
+            return samplepos
+          samplepos += self.bitwidth
+        return samplepos
 
     def wait_for_sop(self, sym):
         # Wait for a Start of Packet (SOP), i.e. a J->K symbol change.
         if sym != 'K' or self.oldsym != 'J':
             return
+
+        self.samplepos = self.samplenum - 0.5 - (self.bitwidth / 2)
+
+        # If the last sample was an SE0/1, consider that the edge.
+        if self.edgepins and symbols[self.signalling][tuple(self.edgepins)] != 'J':
+          self.samplepos -= 0.5
+
+        if self.samplepos_quality(self.samplepos) < self.samplepos_quality(self.samplepos+1):
+          self.samplepos += 1
+
         self.consecutive_ones = 0
         self.bits = ''
         self.update_bitrate()
-        self.samplepos = self.samplenum - (self.bitwidth / 2) + 0.5
         self.set_new_target_samplenum()
         self.putpx(['SOP', None])
         self.putx([4, ['SOP', 'S']])
@@ -268,15 +291,6 @@ class Decoder(srd.Decoder):
             self.signalling = 'low-speed-rp'
             self.update_bitrate()
             self.oldsym = 'J'
-        if b == '0':
-            edgesym = symbols[self.signalling][tuple(self.edgepins)]
-            if edgesym not in ('SE0', 'SE1'):
-                if edgesym == sym:
-                    self.bitwidth = self.bitwidth - (0.001 * self.bitwidth)
-                    self.samplepos = self.samplepos - (0.01 * self.bitwidth)
-                else:
-                    self.bitwidth = self.bitwidth + (0.001 * self.bitwidth)
-                    self.samplepos = self.samplepos + (0.01 * self.bitwidth)
 
     def handle_idle(self, sym):
         self.samplenum_edge = self.samplenum
@@ -301,7 +315,19 @@ class Decoder(srd.Decoder):
     def decode(self, ss, es, data):
         if not self.samplerate:
             raise SamplerateError('Cannot decode without samplerate.')
-        for (self.samplenum, pins) in data:
+
+        data = iter(data)
+
+        # lookahead buffer is only important when sample rate < 3x signalling rate.
+        self.lookahead_buffer = collections.deque([tuple(next(data))] * 192)
+
+        while len(self.lookahead_buffer):
+            try:
+              self.lookahead_buffer.append(tuple(next(data)))
+            except StopIteration:
+              pass
+            (self.samplenum, pins) = self.lookahead_buffer.popleft()
+
             # State machine.
             if self.state == 'IDLE':
                 # Ignore identical samples early on (for performance reasons).
